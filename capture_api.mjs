@@ -25,14 +25,21 @@ const SECONDS = Number(getArg('seconds', 12));
 const OUT = getArg('out', 'capture.json');
 const SEND = getArg('send', '');
 
+// 解析 playwright-core。只认真实 .js 文件，别让解析结果落到目录上。
+// （历史坑：把插件自己的 package.json 当搜索起点时，插件目录 @local/dsh-doubao 是目录，
+//   ESM 不允许 import 目录 → ERR_UNSUPPORTED_DIR_IMPORT）
 function resolvePw() {
-  const req = createRequire(import.meta.url);
-  for (const a of [
+  const starts = [
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@playwright', 'cli', 'package.json'),
-    path.join(WS, 'package.json'),
-  ].filter((p) => existsSync(p))) {
+    path.join(WS, 'node_modules', 'playwright-core', 'package.json'),
+  ].filter((p) => existsSync(p));
+  for (const start of starts) {
     try {
-      return createRequire(a).resolve('playwright-core');
+      const resolved = createRequire(start).resolve('playwright-core');
+      if (typeof resolved !== 'string' || !resolved) continue;
+      if (!/\.(c|m)?js$/i.test(resolved)) continue;
+      if (!existsSync(resolved)) continue;
+      return resolved;
     } catch {
       /* next */
     }
@@ -43,12 +50,74 @@ function resolvePw() {
 const INTEREST = [/\/samantha\//i, /\/api\//i, /\/alice\//i, /completion/i, /conversation/i, /\/chat\//i];
 const SKIP_EXT = /\.(js|css|png|jpe?g|webp|gif|svg|woff2?|ttf|mp4|ico|map)(\?|$)/i;
 
-const mod = await import(pathToFileURL(resolvePw()).href);
+const pwPath = resolvePw();
+if (!pwPath) {
+  console.error('[错误] 找不到 playwright-core，抓包需要它来驱动 Edge。');
+  console.error('  安装：npm i -g @playwright/cli');
+  process.exit(1);
+}
+
+const mod = await import(pathToFileURL(pwPath).href);
 const chromium = mod.chromium || mod.default?.chromium;
+
+// 连不上就自己拉起一个离屏 Edge —— 否则用户得先手动开 Edge 再开调试端口，
+// 这一步对「第一次跑」的人来说太不友好（而且他未必知道要这么做）。
+async function cdpUp() {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/json/version`);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function startEdgeIfNeeded() {
+  if (await cdpUp()) return 'reused';
+
+  const candidates = [
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  ];
+  const edge = candidates.find((p) => existsSync(p));
+  if (!edge) throw new Error('未找到 msedge.exe，请先安装 Microsoft Edge');
+
+  const profile = path.join(WS, 'doubao_edge_profile');
+  const { spawn: spawnEdge } = await import('node:child_process');
+  // 窗口放到屏幕外，不打扰用户
+  spawnEdge(
+    edge,
+    [
+      `--remote-debugging-port=${PORT}`,
+      `--user-data-dir=${profile}`,
+      '--window-position=-3200,-3200',
+      '--no-first-run',
+      '--no-default-browser-check',
+      'https://www.doubao.com/chat/',
+    ],
+    { detached: true, stdio: 'ignore' },
+  ).unref();
+
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    if (await cdpUp()) return 'started';
+    await sleep(500);
+  }
+  throw new Error('启动了 Edge 但调试端口一直没响应（30 秒超时）');
+}
+
+const edgeState = await startEdgeIfNeeded();
+if (edgeState === 'started') console.log('[capture] 已启动离屏 Edge');
+await sleep(3000); // 给页面一点时间加载
+
 const browser = await chromium.connectOverCDP(`http://127.0.0.1:${PORT}`);
 const ctx = browser.contexts()[0];
-const page = ctx.pages().find((p) => p.url().includes('doubao.com'));
-if (!page) throw new Error('找不到豆包页面');
+let page = ctx.pages().find((p) => p.url().includes('doubao.com'));
+if (!page) {
+  // 新 profile 第一次打开时可能还停在空白页，主动导航
+  page = ctx.pages()[0] || (await ctx.newPage());
+  await page.goto('https://www.doubao.com/chat/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(2000);
+}
 
 const records = [];
 const bodyOf = new Map(); // request -> Promise<string>

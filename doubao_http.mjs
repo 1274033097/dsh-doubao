@@ -65,27 +65,136 @@ function collectRefArgs() {
 }
 
 // ── 身份参数（同一浏览器配置下稳定；首次从抓包生成，之后复用）
+//
+// 为什么要有这个文件：豆包 /chat/completion 的 query 里带 device_id / web_id / fp / tea_uuid
+// 等设备参数，缺了服务端会拒。这些值不是常量，每个浏览器配置每台机器都不一样，所以只能
+// 从一次真实请求里抓出来。
+//
+// 开源版故意不含 doubao_identity.json（那是作者本机的设备指纹），所以第一次用必须先拿到它。
+// 三条获取途径，按从简到繁：
+//   1) 环境变量（如果上游已经拿到了，直接注入，最少改动）
+//   2) 抓包文件（--capture 指定）—— 由 capture_api.mjs 生成
+//   3) 从 cookie 里的 web_id / device_id 反推（豆包 cookie 里就带这两个，成功率很高）
+//
+// 全都失败时才报错，并且报得让人能照着做，而不是抛一个 ENOENT 堆栈。
 async function loadIdentity() {
-  if (existsSync(IDENT_FILE)) return JSON.parse(await readFile(IDENT_FILE, 'utf8'));
+  if (existsSync(IDENT_FILE)) {
+    try {
+      const j = JSON.parse(await readFile(IDENT_FILE, 'utf8'));
+      if (j && j.device_id) return j;
+    } catch {
+      /* 文件坏了，往下走恢复路径 */
+    }
+  }
+
+  // ── 途径 1：环境变量注入（CI / 脚本场景）
+  if (process.env.DOUBAO_IDENTITY_JSON) {
+    try {
+      const j = JSON.parse(process.env.DOUBAO_IDENTITY_JSON);
+      if (j && j.device_id) {
+        await writeFile(IDENT_FILE, JSON.stringify(j, null, 2), 'utf8');
+        console.log('[identity] 已从 DOUBAO_IDENTITY_JSON 环境变量写入 →', IDENT_FILE);
+        return j;
+      }
+    } catch {
+      /* 环境变量格式不对，继续 */
+    }
+  }
+
+  // ── 途径 2：抓包文件
   const capPath = getArg('capture', 'cap_image.json');
-  const cap = JSON.parse(await readFile(capPath, 'utf8'));
-  const rec = cap.records.find((r) => /\/chat\/completion/.test(r.url));
-  if (!rec) throw new Error('抓包里没有 /chat/completion，无法提取身份参数');
-  const p = new URL(rec.url).searchParams;
-  const ident = {
-    aid: p.get('aid'),
-    device_id: p.get('device_id'),
-    doubao_pc_version: p.get('doubao_pc_version'),
-    fp: p.get('fp'),
-    pc_version: p.get('pc_version'),
-    real_aid: p.get('real_aid'),
-    tea_uuid: p.get('tea_uuid'),
-    version_code: p.get('version_code'),
-    web_id: p.get('web_id'),
-  };
-  await writeFile(IDENT_FILE, JSON.stringify(ident, null, 2), 'utf8');
-  console.log('[identity] 已从抓包提取并保存 →', IDENT_FILE);
-  return ident;
+  if (existsSync(capPath)) {
+    try {
+      const cap = JSON.parse(await readFile(capPath, 'utf8'));
+      const rec = (cap.records || []).find((r) => /\/chat\/completion/.test(r.url || ''));
+      if (rec) {
+        const p = new URL(rec.url).searchParams;
+        const ident = {
+          aid: p.get('aid'),
+          device_id: p.get('device_id'),
+          doubao_pc_version: p.get('doubao_pc_version'),
+          fp: p.get('fp'),
+          pc_version: p.get('pc_version'),
+          real_aid: p.get('real_aid'),
+          tea_uuid: p.get('tea_uuid'),
+          version_code: p.get('version_code'),
+          web_id: p.get('web_id'),
+        };
+        await writeFile(IDENT_FILE, JSON.stringify(ident, null, 2), 'utf8');
+        console.log('[identity] 已从抓包提取并保存 →', IDENT_FILE);
+        return ident;
+      }
+    } catch {
+      /* 抓包文件坏了，继续 */
+    }
+  }
+
+  // ── 途径 3：让浏览器自己告诉我们（最可靠）
+  // 设备参数由豆包网页的 JS 生成，cookie 里没有（实测 s_v_web_id 格式像 fp 但值不同），
+  // 所以只能从一次真实请求里读。这里复用已有的 capture_api.mjs —— 它会用
+  // playwright 打开豆包、发一次测试消息、截取 /chat/completion 的 URL。
+  if (existsSync(path.join(WS, 'capture_api.mjs'))) {
+    console.log('[identity] 缺少设备身份文件，尝试自动抓取一次（约 15-30 秒）…');
+    try {
+      const { spawnSync } = await import('node:child_process');
+      const capOut = path.join(WS, 'cap_image.json');
+      const r = spawnSync(process.execPath, ['capture_api.mjs', '--send', '测试', '--out', capOut], {
+        cwd: WS,
+        stdio: 'inherit',
+        timeout: 180000,
+      });
+      if (r.status === 0 && existsSync(capOut)) {
+        const cap = JSON.parse(await readFile(capOut, 'utf8'));
+        const rec = (cap.records || []).find((x) => /\/chat\/completion/.test(x.url || ''));
+        if (rec) {
+          const p = new URL(rec.url).searchParams;
+          const ident = {
+            aid: p.get('aid'),
+            device_id: p.get('device_id'),
+            doubao_pc_version: p.get('doubao_pc_version'),
+            fp: p.get('fp'),
+            pc_version: p.get('pc_version'),
+            real_aid: p.get('real_aid'),
+            tea_uuid: p.get('tea_uuid'),
+            version_code: p.get('version_code'),
+            web_id: p.get('web_id'),
+          };
+          if (ident.device_id) {
+            await writeFile(IDENT_FILE, JSON.stringify(ident, null, 2), 'utf8');
+            console.log('[identity] 已自动抓取并保存 →', IDENT_FILE);
+            return ident;
+          }
+        }
+      }
+    } catch {
+      /* 自动抓取失败，落到下面的报错 */
+    }
+  }
+
+  // ── 全失败：给人话，而不是 ENOENT 堆栈
+  console.error('');
+  console.error('════════════════════════════════════════════════════════════');
+  console.error('[缺少设备身份文件] 需要 doubao_identity.json 才能调用豆包接口。');
+  console.error('');
+  console.error('这个文件含设备参数（device_id / web_id / fp 等），由豆包网页的 JS 生成，');
+  console.error('每台机器不同，所以开源版不包含它。生成方式：');
+  console.error('');
+  console.error('  ① 自动（推荐，本插件会自己抓）：');
+  console.error('       node capture_api.mjs --send "测试" --out cap_image.json');
+  console.error('       node doubao_http.mjs models --for image');
+  console.error('');
+  console.error('  ② 手动：打开 https://www.doubao.com 并登录，F12 → Network，');
+  console.error('     随便发一句话，找到 /chat/completion 请求，复制它 URL 里的 query 参数，');
+  console.error('     填进 doubao_identity.json（格式见 doubao_identity.example.json）');
+  console.error('');
+  console.error('  ③ 从别人那里拿一份可用的 doubao_identity.json 放进本目录');
+  console.error('     （注意：设备指纹会共享，可能触发风控，建议优先用 ①②）');
+  console.error('');
+  console.error('  自动抓取需要 playwright：npm i -g @playwright/cli');
+  console.error('  期望路径: ' + IDENT_FILE);
+  console.error('════════════════════════════════════════════════════════════');
+  console.error('');
+  process.exit(4);
 }
 
 const ident = await loadIdentity();
