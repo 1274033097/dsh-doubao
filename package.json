@@ -1,0 +1,44 @@
+{
+  "name": "@local/dsh-doubao",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "豆包生图 / 生视频面板：左侧栏入口，直接复用本机豆包会员额度",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "doubao.mjs",
+    "doubao_http.mjs",
+    "doubao_gen.mjs",
+    "doubao_upload.mjs",
+    "login.mjs",
+    "logout.mjs",
+    "get_cookies.mjs",
+    "watch-video.mjs",
+    "capture_api.mjs",
+    "capture_member_request.mjs",
+    "check_conv.mjs",
+    "doubao_identity.json",
+    "*.cmd",
+    "*.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["slots"]
+    }
+  }
+}

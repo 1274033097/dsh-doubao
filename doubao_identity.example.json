@@ -1,0 +1,12 @@
+{
+  "_comment": "把这个文件改名为 doubao_identity.json 并填入你自己的设备参数。用 capture_api.mjs 抓包自动生成。",
+  "aid": "49xxxx",
+  "device_id": "<你的 device_id>",
+  "doubao_pc_version": "3.45.5",
+  "fp": "<你的 fp>",
+  "pc_version": "3.45.5",
+  "real_aid": "49xxxx",
+  "tea_uuid": "<你的 tea_uuid>",
+  "version_code": "20800",
+  "web_id": "<你的 web_id>"
+}

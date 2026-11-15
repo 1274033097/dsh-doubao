@@ -1,0 +1,31 @@
+# 登录态与凭据（绝不能提交）
+doubao_cookies.txt
+doubao_*.cookies.txt
+doubao_identity.json
+doubao_edge_profile/
+
+# 生成产物
+doubao_out/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+!icon.svg
+!assets/**
+
+# 抓包 / 调试产物
+cap*.json
+capture*.json
+fail_*.json
+shot_*.png
+
+# 依赖与系统
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# 编辑器
+.vscode/
+.idea/

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Doubao image and video generation",
+    "description": "Opens a Doubao panel from the left sidebar to generate images and videos with your local Doubao membership and save them into doubao_out."
+  }
+}

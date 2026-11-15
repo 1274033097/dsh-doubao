@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-doubao
+      name: '@local/dsh-doubao'
+      config: {}
