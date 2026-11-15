@@ -128,18 +128,49 @@ function withCountHint(p) {
   return `生成${genCount}张构图各不相同的图片：${p}`;
 }
 
+// 解析 playwright-core。要找到的是「真正的文件」，不能是目录。
+//
+// 历史坑（2026-11-15）：过去把插件自己的 package.json 也当搜索起点，
+// 而插件目录名是 @local/dsh-doubao —— 在 profile 的 node_modules 里它是**目录**。
+// Node 的 ESM 解析器不允许 import 目录，于是报：
+//   ERR_UNSUPPORTED_DIR_IMPORT: Directory import '...\node_modules\@local\dsh-doubao'
+// 所以：只认真实文件（.js/.cjs/.mjs）、且必须存在；解析到目录/自身一律跳过。
 function resolvePw() {
-  for (const a of [
+  const starts = [
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@playwright', 'cli', 'package.json'),
-    path.join(WS, 'package.json'),
-  ].filter((p) => existsSync(p))) {
+    path.join(WS, 'node_modules', 'playwright-core', 'package.json'),
+  ].filter((p) => existsSync(p));
+
+  for (const start of starts) {
     try {
-      return createRequire(a).resolve('playwright-core');
+      const resolved = createRequire(start).resolve('playwright-core');
+      if (typeof resolved !== 'string' || !resolved) continue;
+      if (!/\.(c|m)?js$/i.test(resolved)) continue;
+      if (!existsSync(resolved)) continue;
+      return resolved;
     } catch {
       /* next */
     }
   }
   return '';
+}
+
+/**
+ * 加载 playwright-core。找不到就抛一个**人能看懂**的错误，
+ * 而不是让 pathToFileURL('') 产生一个莫名其妙的 ESM 异常。
+ */
+async function loadPlaywright() {
+  const pw = resolvePw();
+  if (!pw) {
+    throw new Error(
+      [
+        '找不到 playwright-core（浏览器模式需要它）。处理二选一：',
+        '  ① npm i -g @playwright/cli  然后重跑',
+        '  ② 改用直连模式：加 --mode direct（不需要浏览器）',
+      ].join('\n'),
+    );
+  }
+  return import(pathToFileURL(pw).href);
 }
 
 async function ensureEdge() {
@@ -155,7 +186,7 @@ async function ensureEdge() {
     if (String(args['restart-edge']) === 'true') {
       // 必须「优雅关闭」：强杀会让 Chromium 来不及把 cookie 落盘，登录态会丢
       try {
-        const mod = await import(pathToFileURL(resolvePw()).href);
+        const mod = await loadPlaywright();
         const chromium = mod.chromium || mod.default?.chromium;
         const b = await chromium.connectOverCDP(`http://127.0.0.1:${PORT}`);
         await b.close(); // 对 CDP 连接而言等价于 Browser.close，浏览器会正常退出并刷盘
@@ -542,7 +573,7 @@ const step = (name, value) => {
 
 try {
   step('edge', await ensureEdge());
-  const mod = await import(pathToFileURL(resolvePw()).href);
+  const mod = await loadPlaywright();
   const chromium = mod.chromium || mod.default?.chromium;
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${PORT}`);
   const ctx = browser.contexts()[0];

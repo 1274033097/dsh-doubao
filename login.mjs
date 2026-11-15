@@ -89,13 +89,30 @@ async function verify() {
 }
 
 // ───────────────────────── 方式一：离屏 Edge（默认）
+// 解析 playwright-core。要找到的是「真正的文件」，不能是目录。
+//
+// 历史坑（2026-11-15）：过去会把插件目录自己也放进 createRequire 的搜索起点，
+// 而插件目录名是 @local/dsh-doubao —— 在 profile 的 node_modules 里它是一个**目录**。
+// Node 的 ESM 解析器不允许 import 目录，于是报：
+//   ERR_UNSUPPORTED_DIR_IMPORT: Directory import '...\node_modules\@local\dsh-doubao'
+// 所以这里必须：
+//   1) 只要有 leads to a directory 就丢弃；
+//   2) 只接受以 .js/.cjs/.mjs 结尾的真实文件；
+//   3) 把插件自己的 package.json 从搜索起点里剔除（否则解析器会跑到自身包里找）。
 function resolvePw() {
-  for (const a of [
+  const starts = [
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@playwright', 'cli', 'package.json'),
-    path.join(WS, 'package.json'),
-  ].filter((p) => existsSync(p))) {
+    path.join(WS, 'node_modules', 'playwright-core', 'package.json'),
+  ].filter((p) => existsSync(p));
+
+  for (const start of starts) {
     try {
-      return createRequire(a).resolve('playwright-core');
+      const resolved = createRequire(start).resolve('playwright-core');
+      // 只认真实文件；目录（或解析到插件自身）一律跳过
+      if (typeof resolved !== 'string' || !resolved) continue;
+      if (!/\.(c|m)?js$/i.test(resolved)) continue;
+      if (!existsSync(resolved)) continue;
+      return resolved;
     } catch {
       /* next */
     }
@@ -181,9 +198,22 @@ async function hardCloseEdge() {
 async function browserLogin() {
   const t0 = Date.now();
   console.log('① 启动离屏 Edge（窗口在屏幕外，不影响你）…');
+
+  // 先确认 playwright-core 找得到，再拉 Edge —— 否则会先无谓地拉起一个浏览器再崩
+  const pwPath = resolvePw();
+  if (!pwPath) {
+    console.error('\n[错误] 找不到 playwright-core（扫码登录需要它来驱动 Edge）。');
+    console.error('  处理二选一：');
+    console.error('    ① 安装：npm i -g @playwright/cli   然后重跑');
+    console.error('    ② 改用纯 HTTP 扫码，不依赖浏览器：node login.mjs --mode http');
+    console.error('    ③ 或者：自己用 Edge 登录豆包后关闭 Edge，跑 node get_cookies.mjs');
+    process.exitCode = 1;
+    return;
+  }
+
   console.log('   ' + (await ensureEdge()));
 
-  const mod = await import(pathToFileURL(resolvePw()).href);
+  const mod = await import(pathToFileURL(pwPath).href);
   const chromium = mod.chromium || mod.default?.chromium;
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${PORT}`);
   const ctx = browser.contexts()[0];
