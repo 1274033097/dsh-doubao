@@ -20,6 +20,7 @@
     "doubao_http.mjs",
     "doubao_gen.mjs",
     "doubao_upload.mjs",
+    "browser.mjs",
     "login.mjs",
     "logout.mjs",
     "get_cookies.mjs",

@@ -23,6 +23,8 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// 浏览器探测：不再硬编码 msedge.exe，改用系统默认浏览器 + 已安装回退
+import { pickBrowser, describeFailure } from './browser.mjs';
 
 const WS = process.cwd();
 const OUT_DIR = process.env.DOUBAO_OUT || path.join(WS, 'doubao_out');
@@ -89,16 +91,19 @@ async function verify() {
 }
 
 // ───────────────────────── 方式一：离屏 Edge（默认）
-// 解析 playwright-core。要找到的是「真正的文件」，不能是目录。
+// 解析 playwright-core，并且**拿到 ESM 入口**。
 //
-// 历史坑（2026-11-15）：过去会把插件目录自己也放进 createRequire 的搜索起点，
-// 而插件目录名是 @local/dsh-doubao —— 在 profile 的 node_modules 里它是一个**目录**。
-// Node 的 ESM 解析器不允许 import 目录，于是报：
-//   ERR_UNSUPPORTED_DIR_IMPORT: Directory import '...\node_modules\@local\dsh-doubao'
-// 所以这里必须：
-//   1) 只要有 leads to a directory 就丢弃；
-//   2) 只接受以 .js/.cjs/.mjs 结尾的真实文件；
-//   3) 把插件自己的 package.json 从搜索起点里剔除（否则解析器会跑到自身包里找）。
+// 2026-11-15 两个踩坑记录（下面这段代码同时防这两个）：
+//
+//  坑 1：把插件自己的 package.json 当搜索起点，而插件目录名 @local/dsh-doubao 在 profile
+//        的 node_modules 里是**目录**。ESM 不允许 import 目录，报
+//        ERR_UNSUPPORTED_DIR_IMPORT。→ 所以搜索起点不能是插件自身，且必须落到真实文件。
+//
+//  坑 2（更隐蔽）：playwright-core 的 exports 声明了 import: ./index.mjs / require: ./index.js。
+//        createRequire().resolve() 走的是 **require 条件**，拿到 index.js（CJS）。
+//        再用动态 import() 加载 CJS 时，Node 互操作只挂 default，
+//        于是 `mod.chromium` 是 undefined，只有 `mod.default.chromium` 有值。
+//        → 所以优先取同一目录下的 index.mjs，这样 import 出来顶层就有 chromium。
 function resolvePw() {
   const starts = [
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@playwright', 'cli', 'package.json'),
@@ -107,17 +112,27 @@ function resolvePw() {
 
   for (const start of starts) {
     try {
-      const resolved = createRequire(start).resolve('playwright-core');
-      // 只认真实文件；目录（或解析到插件自身）一律跳过
-      if (typeof resolved !== 'string' || !resolved) continue;
-      if (!/\.(c|m)?js$/i.test(resolved)) continue;
-      if (!existsSync(resolved)) continue;
-      return resolved;
+      const cjsEntry = createRequire(start).resolve('playwright-core');
+      if (typeof cjsEntry !== 'string' || !cjsEntry) continue;
+      if (!existsSync(cjsEntry)) continue;
+      if (!/\.(c|m)?js$/i.test(cjsEntry)) continue; // 目录/无扩展名一律跳过
+
+      // 优先 ESM 入口（顶层直接有 chromium）
+      const esmEntry = path.join(path.dirname(cjsEntry), 'index.mjs');
+      if (existsSync(esmEntry)) return esmEntry;
+
+      // 老版本没 index.mjs 就用 CJS；调用方会用 pickChromium 兜底 default.chromium
+      return cjsEntry;
     } catch {
       /* next */
     }
   }
   return '';
+}
+
+/** 兼容两种导出形态：ESM 入口顶层有 chromium；CJS 经 import() 只有 default.chromium */
+function pickChromium(mod) {
+  return (mod && mod.chromium) || (mod && mod.default && mod.default.chromium) || null;
 }
 
 const cdpUp = async () => {
@@ -131,14 +146,12 @@ const cdpUp = async () => {
 
 async function ensureEdge() {
   if (await cdpUp()) return 'reused';
-  const edge = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  ].find((p) => existsSync(p));
-  if (!edge) throw new Error('未找到 msedge.exe');
+  // 不再硬编码 msedge.exe：用 browser.mjs 统一探测（默认浏览器 → 已安装的回退）
+  const picked = pickBrowser();
+  if (!picked.path) throw new Error(describeFailure());
   await mkdir(PROFILE, { recursive: true });
   const child = spawn(
-    edge,
+    picked.path,
     [
       `--remote-debugging-port=${PORT}`,
       `--user-data-dir=${PROFILE}`,
@@ -153,10 +166,10 @@ async function ensureEdge() {
   child.unref();
   const dl = Date.now() + 30000;
   while (Date.now() < dl) {
-    if (await cdpUp()) return 'spawned(off-screen)';
+    if (await cdpUp()) return `spawned(off-screen, ${picked.name}, via ${picked.via})`;
     await sleep(400);
   }
-  throw new Error('Edge DevTools 未就绪');
+  throw new Error(`${picked.name} 的 DevTools 端口未就绪（30 秒超时）`);
 }
 
 // 用 CDP 的 Browser.close 真正关掉 Edge，并等端口消失（确保 cookie 落盘、profile 解锁）
@@ -214,7 +227,13 @@ async function browserLogin() {
   console.log('   ' + (await ensureEdge()));
 
   const mod = await import(pathToFileURL(pwPath).href);
-  const chromium = mod.chromium || mod.default?.chromium;
+  const chromium = pickChromium(mod);
+  if (!chromium) {
+    console.error('\n[错误] playwright-core 加载到了，但拿不到 chromium。');
+    console.error('  通常是版本不兼容。试：npm i -g @playwright/cli@latest');
+    process.exitCode = 1;
+    return;
+  }
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${PORT}`);
   const ctx = browser.contexts()[0];
   let page = ctx.pages().find((p) => p.url().includes('doubao.com')) || ctx.pages()[0] || (await ctx.newPage());
@@ -233,7 +252,34 @@ async function browserLogin() {
   };
 
   await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-  await sleep(4000);
+
+  // 等「登录」按钮真的出现再继续。
+  // 实测：domcontentloaded 之后页面还在水合，固定 sleep(4000) 有时不够，
+  // 按钮还没渲染出来就去点，自然点不到（整页截图里就是还没加载完的首页）。
+  const waitForLoginButton = async (timeoutMs = 20000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const found = await page
+        .evaluate(() => {
+          if (document.querySelector('[data-testid="to_login_button"]')) return 'testid';
+          for (const x of document.querySelectorAll('button')) {
+            if (/^登录$/.test((x.innerText || '').trim())) {
+              const r = x.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) return 'text';
+            }
+          }
+          return '';
+        })
+        .catch(() => '');
+      if (found) return found;
+      await sleep(500);
+    }
+    return '';
+  };
+  const btnHow = await waitForLoginButton();
+  if (btnHow) console.log('   登录按钮已出现（' + btnHow + '）');
+  else console.log('   ⚠ 20 秒内没等到登录按钮');
+  await sleep(800);
 
   const isLoggedIn = async () => {
     const cs = await ctx.cookies('https://www.doubao.com').catch(() => []);
@@ -251,43 +297,293 @@ async function browserLogin() {
   }
 
   console.log('② 打开登录弹窗…');
-  await page
-    .evaluate(() => {
-      const el = document.querySelector('[data-testid="to_login_button"]');
-      if (el) return el.click();
-      const cands = Array.from(document.querySelectorAll('button,div,span,a'));
-      const hit = cands.find((e) => /^(登录|立即登录)$/.test((e.innerText || '').trim()) && e.getBoundingClientRect().width > 0);
-      if (hit) hit.click();
-      return null;
-    })
-    .catch(() => {});
-  await sleep(5000);
+
+  /**
+   * 点开登录弹窗。
+   *
+   * 2026-11-15 实测查清了两个坑：
+   *
+   *  坑 1：`[data-testid="to_login_button"]` 这个选择器其实**还在**（页面没改版），
+   *        但 Playwright 的 click() 会超时 8 秒、`el.click()` 也毫无反应。
+   *
+   *  坑 2（真因）：豆包未登录首页给整层套了 `pointer-events: none`。
+   *        实测按钮及其 8 层祖先全是 pointer-events:none，
+   *        document.elementFromPoint(按钮中心) 命中的是别的容器。
+   *        所以任何「按坐标/按命中检测」的点击都会被浏览器丢掉。
+   *
+   * 解法：用 dispatchEvent 手工派发完整鼠标事件序列 —— 它不经过命中检测，
+   * 所以能穿透 pointer-events:none。实测点击后二维码立刻出现。
+   *
+   * 顺序：先精确 testid → 再按文字 → 再按右上角位置兜底。
+   */
+  const fireClick = (selectorOrPicker) =>
+    page
+      .evaluate((kind) => {
+        let el = null;
+        if (kind.type === 'testid') {
+          el = document.querySelector('[data-testid="to_login_button"]');
+        } else if (kind.type === 'text') {
+          const cands = [];
+          for (const x of document.querySelectorAll('button,a,[role=button],div,span')) {
+            const t = (x.innerText || '').trim();
+            if (!/^(登录|立即登录|登录\/注册|扫码登录)$/.test(t)) continue;
+            const r = x.getBoundingClientRect();
+            if (!(r.width > 0 && r.height > 0) || r.width > 300 || r.height > 90) continue;
+            cands.push({ x, right: window.innerWidth - (r.x + r.width) });
+          }
+          cands.sort((a, b) => a.right - b.right);
+          el = cands.length ? cands[0].x : null;
+        } else {
+          // 位置兜底：最靠右上的按钮
+          const b = Array.from(document.querySelectorAll('button'))
+            .map((x) => ({ x, r: x.getBoundingClientRect() }))
+            .filter((v) => v.r.width > 0 && v.r.height > 0 && v.r.y < 120)
+            .sort((a, b2) => b2.r.x - a.r.x);
+          el = b.length ? b[0].x : null;
+        }
+        if (!el) return 'not-found';
+
+        // 只派发事件，**不**改 pointer-events、也不额外调 el.click()。
+        //
+        // 为什么这么克制（2026-11-15 实测对比）：
+        //   - 纯 dispatchEvent 序列：点击成功、二维码出现（PASS）
+        //   - dispatchEvent + el.click()：也成功
+        //   - 但「先临时把 pointer-events 改成 auto」的做法，
+        //     会让 React 的合成事件系统在还原样式时丢失状态，导致弹窗开了又关。
+        //   dispatchEvent 本身不经过命中检测，所以 pointer-events:none 拦不住它，
+        //   根本不需要改样式。
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        el.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1, isPrimary: true }));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new PointerEvent('pointerup', { ...opts, pointerId: 1, isPrimary: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        return 'dispatched';
+      }, selectorOrPicker)
+      .catch((e) => 'ERR:' + e.message);
+
+  // 已登录就直接跳过
+  if (await isLoggedIn()) {
+    console.log('   检测到已登录，跳过点按钮');
+  } else {
+    // 逐个尝试选择器，**成功一次就立刻停**。
+    // 之前写成嵌套循环：testid 点开后弹窗已出现，但检测稍慢没命中，
+    // 于是 text / pos 又各点了一次 —— 第二次点击把刚打开的弹窗又关掉了。
+    // 现在每轮结束都检查 popped，命中就完全不碰后面的选择器。
+    let popped = false;
+    const checkQr = async () => {
+      return page
+        .evaluate(() => {
+          if (document.querySelector('[class*=qrcode],[class*=qr-code],[class*=QrCode]')) return true;
+          return /扫码登录|二维码|请使用.*客户端扫描/.test((document.body.innerText || '').replace(/\s+/g, ' '));
+        })
+        .catch(() => false);
+    };
+
+    for (let attempt = 1; attempt <= 3 && !popped; attempt += 1) {
+      for (const picker of [{ type: 'testid' }, { type: 'text' }, { type: 'pos' }]) {
+        const r = await fireClick(picker);
+        if (r === 'not-found') continue;
+
+        // 给足等待：弹窗 + 二维码图渲染通常 1~3 秒，这里最多等 10 秒
+        for (let i = 0; i < 20; i += 1) {
+          await sleep(500);
+          if (await checkQr()) {
+            popped = true;
+            break;
+          }
+        }
+        // 关键：一旦出现就跳出，绝不再用下一个选择器点第二次
+        if (popped) break;
+      }
+    }
+    if (!popped) console.log('   ⚠ 点击后仍没看到二维码，继续尝试截图');
+  }
+  await sleep(1500);
 
   await mkdir(OUT_DIR, { recursive: true });
+
+  /**
+   * 关掉挡住二维码的**推广浮层**。
+   *
+   * 2026-11-15 关键教训：这段逻辑必须**绝不能碰登录弹窗本身**。
+   * 原来的实现在每次截图前无差别点击所有 close 系按钮 —— 包括登录弹窗自己的 ✕，
+   * 结果二维码刚渲染出来就被自己关掉了。表现就是：调试脚本能量到二维码，
+   * login.mjs 却永远「没定位到二维码元素」。
+   *
+   * 现在只处理「明确是推广/订阅/公告」的浮层，且跳过任何包含二维码的容器。
+   */
+  const dismissOverlays = async () => {
+    await page
+      .evaluate(() => {
+        // 判定：这个元素（或它的祖先）是不是登录弹窗？是就不许碰
+        const isLoginDialog = (node) => {
+          for (let n = node; n && n !== document.body; n = n.parentElement) {
+            if (n.querySelector && n.querySelector('[class*=qrcode],[class*=qr-code]')) return true;
+            const role = n.getAttribute && n.getAttribute('role');
+            if (role === 'dialog' && /登录|扫码|login/i.test(n.innerText || '')) return true;
+          }
+          return false;
+        };
+        // 判定：是不是推广类浮层（订阅权益 / 使用更畅快 / 开通会员 …）
+        const isPromo = (node) => /订阅|权益|会员|畅快|升级|试用|开通/.test((node.innerText || '').slice(0, 200));
+
+        const closers = [
+          '[aria-label="关闭"]',
+          '[aria-label="Close"]',
+          '[data-testid*="close" i]',
+          '[class*="close-btn"]',
+          '[class*="closeBtn"]',
+        ];
+        for (const sel of closers) {
+          for (const el of document.querySelectorAll(sel)) {
+            const r = el.getBoundingClientRect();
+            if (!(r.width > 0 && r.height > 0)) continue;
+            // 跳过登录弹窗里的关闭按钮；只关推广浮层上的
+            if (isLoginDialog(el)) continue;
+            const host = el.closest('[class*=modal],[class*=popup],[class*=dialog],[class*=overlay]') || el.parentElement;
+            if (host && !isPromo(host)) continue;
+            el.click();
+          }
+        }
+        // 推广浮层的「跳过 / 以后再说」才算；「取消」容易命中登录弹窗，去掉
+        const skipTexts = /^(跳过|以后再说|暂不|我知道了|知道了)$/;
+        for (const el of document.querySelectorAll('button,a,div,span')) {
+          const t = (el.innerText || '').trim();
+          if (!skipTexts.test(t)) continue;
+          if (isLoginDialog(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0 && r.width < 220 && r.height < 60) el.click();
+        }
+      })
+      .catch(() => {});
+    await sleep(600);
+  };
+
+  /**
+   * 找出真正的二维码元素（返回它的位置矩形，而不是 handle）。
+   *
+   * 为什么返回矩形而不是 elementHandle：
+   *   1) elementHandle 在 dismissOverlays 改动 DOM 后可能失效；
+   *   2) 豆包给页面套了 pointer-events:none，elementHandle.screenshot 有时截不到内容；
+   *   3) 我们最终只要一张图，直接用 page.screenshot({clip}) 最稳。
+   *
+   * 打分依据：
+   *   + 接近正方形（二维码一定 1:1）
+   *   + 边长 100~400（太小是图标，太大是整块面板）
+   *   + 内部有 img / canvas
+   *   - 有大段文字或多个按钮（那是浮层）
+   */
+  const findQrRect = async () => {
+    return page
+      .evaluate(() => {
+        const inView = (r) =>
+          r.x >= 0 && r.y >= 0 && r.x + r.width <= window.innerWidth && r.y + r.height <= window.innerHeight;
+
+        // ── 第一级：尺寸正常的二维码元素（最理想，只截那张图）
+        const qrCands = [];
+        let hasQrButZeroSize = false;
+        for (const el of document.querySelectorAll('[class*=qrcode], [class*=qr-code], [class*=QrCode]')) {
+          const r = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+          // 尺寸为 0 说明还没布局出来（视口小 / 动画未完成），记住它的存在，走回退
+          if (!(r.width > 60 && r.height > 60)) {
+            hasQrButZeroSize = true;
+            continue;
+          }
+          if (!inView(r)) continue;
+          const ratio = r.width / r.height;
+          let score = 0;
+          if (ratio > 0.85 && ratio < 1.18) score += 40;
+          const side = Math.min(r.width, r.height);
+          if (side >= 100 && side <= 400) score += 30;
+          if (el.querySelector('canvas')) score += 30;
+          else if (el.querySelector('img')) score += 25;
+          if ((el.innerText || '').trim().length > 12) score -= 35;
+          if (el.querySelectorAll('button,a').length > 1) score -= 20;
+          qrCands.push({ score, kind: 'qr', rect: { x: r.x, y: r.y, width: r.width, height: r.height } });
+        }
+        qrCands.sort((a, b) => b.score - a.score);
+        if (qrCands.length && qrCands[0].score >= 25) return qrCands[0];
+
+        // ── 第二级：二维码元素存在但尺寸为 0 → 截整个登录弹窗
+        // 2026-11-15 实测：窗口 1280x900 时二维码元素 rect 就是 0x0，
+        // 但它所在的弹窗（role=dialog）尺寸正常，截弹窗一样能扫。
+        const dialogs = [];
+        for (const el of document.querySelectorAll('[role=dialog], [class*=LoginModal], [class*=login-modal], [class*=modal]')) {
+          const r = el.getBoundingClientRect();
+          if (!(r.width > 200 && r.height > 200)) continue;
+          if (!inView(r)) continue;
+          dialogs.push({ area: r.width * r.height, rect: { x: r.x, y: r.y, width: r.width, height: r.height } });
+        }
+        dialogs.sort((a, b) => a.area - b.area); // 最小的那个，避免截到全屏遮罩
+        if (dialogs.length) return { score: 100, kind: 'dialog', rect: dialogs[0].rect };
+
+        // ── 第三级：连弹窗都找不到，但有二维码元素 → 截视口中间那块
+        if (hasQrButZeroSize) {
+          const w = Math.min(520, window.innerWidth * 0.6);
+          const h = Math.min(620, window.innerHeight * 0.8);
+          return {
+            score: 50,
+            kind: 'center',
+            rect: { x: (window.innerWidth - w) / 2, y: (window.innerHeight - h) / 2, width: w, height: h },
+          };
+        }
+        return null;
+      })
+      .catch(() => null);
+  };
+
   let shotRound = 0;
   const shot = async () => {
     shotRound += 1;
-    const el = await page.$('[class*=qrcode]');
-    if (!el) return null;
+    await dismissOverlays();
     const p = path.join(OUT_DIR, shotRound === 1 ? 'login_qr.png' : `login_qr_${shotRound}.png`);
-    await el.screenshot({ path: p }).catch(() => {});
+
+    // findQrRect 返回 { score, kind, rect }；kind 表示截的是「二维码本体 / 整个弹窗 / 居中区域」
+    const found = await findQrRect();
+    if (found && found.rect) {
+      const b = found.rect;
+      // 留 6px 边距，避免把外框切掉
+      const clip = {
+        x: Math.max(0, Math.round(b.x) - 6),
+        y: Math.max(0, Math.round(b.y) - 6),
+        width: Math.round(b.width) + 12,
+        height: Math.round(b.height) + 12,
+      };
+      await page.screenshot({ path: p, clip }).catch(() => {});
+      let sz = 0;
+      try {
+        sz = (await import('node:fs')).statSync(p).size;
+      } catch {}
+      if (sz > 1000) {
+        qrFiles.push(p);
+        const label = found.kind === 'qr' ? '二维码' : found.kind === 'dialog' ? '登录弹窗' : '居中区域';
+        console.log(`\n[${label} #${shotRound}] ${p}  (${Math.round(b.width)}x${Math.round(b.height)})`);
+        if (OPEN) execFile('cmd', ['/c', 'start', '', p], () => {});
+        return p;
+      }
+    }
+
+    // 找不到像样的二维码：退回整页截图，至少让人看到页面现状来排查
+    await page.screenshot({ path: p }).catch(() => {});
     qrFiles.push(p);
-    console.log(`\n[二维码 #${shotRound}] ${p}`);
+    console.log(`\n[整页截图 #${shotRound}] ${p}  （没定位到二维码元素）`);
     if (OPEN) execFile('cmd', ['/c', 'start', '', p], () => {});
-    return p;
+    return null;
   };
 
   const first = await shot();
   if (!first) {
-    console.log('   ⚠ 没找到二维码元素（[class*=qrcode]），可能页面结构变了');
-    const p = path.join(OUT_DIR, 'login_page.png');
-    await page.screenshot({ path: p }).catch(() => {});
-    console.log('   整页截图: ' + p);
-    await finish(5);
-    return;
+    // 已经存了整页截图，说明二维码没定位到：给出可操作建议而不是直接退出
+    console.log('   ⚠ 没定位到二维码。可能是登录弹窗没打开，或页面改版。');
+    console.log('   已保存整页截图便于排查；也可以改用纯 HTTP 扫码：');
+    console.log('     node login.mjs --mode http');
+  } else {
+    console.log('   请用「豆包 APP」或「抖音 APP」扫码，并在手机上点确认');
+    console.log('   二维码由页面自己刷新，过期了我这里会自动重截');
   }
-  console.log('   请用「豆包 APP」或「抖音 APP」扫码，并在手机上点确认');
-  console.log('   二维码由页面自己刷新，过期了我这里会自动重截');
 
   const deadline = Date.now() + TIMEOUT * 1000;
   let lastShot = Date.now();

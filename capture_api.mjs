@@ -11,6 +11,8 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// 浏览器探测：不再硬编码 msedge.exe
+import { pickBrowser, describeFailure } from './browser.mjs';
 
 const WS = process.cwd();
 const PORT = Number(process.env.DOUBAO_EDGE_PORT || 9226);
@@ -74,12 +76,10 @@ async function cdpUp() {
 async function startEdgeIfNeeded() {
   if (await cdpUp()) return 'reused';
 
-  const candidates = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  ];
-  const edge = candidates.find((p) => existsSync(p));
-  if (!edge) throw new Error('未找到 msedge.exe，请先安装 Microsoft Edge');
+  // 不再硬编码 msedge.exe：用 browser.mjs 统一探测
+  const picked = pickBrowser();
+  if (!picked.path) throw new Error(describeFailure());
+  const edge = picked.path;
 
   const profile = path.join(WS, 'doubao_edge_profile');
   const { spawn: spawnEdge } = await import('node:child_process');

@@ -17,6 +17,8 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// 浏览器探测：不再硬编码 msedge.exe
+import { pickBrowser, describeFailure } from './browser.mjs';
 
 const WS = process.cwd();
 const CHAT_URL = 'https://www.doubao.com/chat/';
@@ -198,13 +200,11 @@ async function ensureEdge() {
       return 'reused';
     }
   }
-  const edge =
-    process.env.DOUBAO_EDGE_PATH ||
-    [
-      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    ].find((p) => existsSync(p));
-  if (!edge) throw new Error('未找到 msedge.exe');
+  // 不再硬编码 msedge.exe：用 browser.mjs 统一探测
+  // （环境变量 DOUBAO_BROWSER / 系统默认浏览器 / 已安装的 Chromium 系回退）
+  const picked = pickBrowser();
+  if (!picked.path) throw new Error(describeFailure());
+  const edge = picked.path;
   await mkdir(PROFILE, { recursive: true });
   const { spawn } = await import('node:child_process');
 
